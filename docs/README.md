@@ -1,13 +1,21 @@
 # Pi Developer Onboarding
 
 Internal docs for engineers new to the `pi` monorepo. Everything here is derived from the
-code — file paths are real, line numbers are from the current checkout.
+current checkout; file paths are real, and line numbers are from this tree.
+
+Every workspace package shares version `1.4.0`; all require **Node >= 22.19.0**.
 
 ## What pi is
 
-Pi is an agent harness: a runtime for LLM tool-calling loops (`packages/agent`), a unified
-multi-provider LLM API (`packages/ai`), a terminal UI library (`packages/tui`), and a
-self-extensible coding agent CLI built on all three (`packages/coding-agent`).
+Pi is a minimal, extensible agent harness and a coding-agent CLI built on it.
+
+- `packages/agent` — the core agent loop: tool calling, streaming, state, events.
+- `packages/ai` — one API for many LLM providers, plus image and classifier models.
+- `packages/tui` — the terminal UI library used by the CLI.
+- `packages/coding-agent` — the `pi` CLI, SDK, extensions, MCP, and codemode.
+
+Supporting libraries: `codemode` (sandboxed tool-calling JavaScript), `mcp` (MCP client),
+`telemetry` (explicit spans and metrics), and `chord` (standalone object/contract runtime).
 
 ## Read in this order
 
@@ -19,47 +27,48 @@ self-extensible coding agent CLI built on all three (`packages/coding-agent`).
 | 4 | [agent-runtime.md](agent-runtime.md) | You are touching `packages/ai` or `packages/agent`. |
 | 5 | [coding-agent.md](coding-agent.md) | You are touching `packages/coding-agent` (the `pi` CLI). |
 | 6 | [tui.md](tui.md) | You are touching `packages/tui`. |
-| 7 | [infrastructure.md](infrastructure.md) | You are touching chord, durable, telemetry, protocol, client, server, or evals. |
+| 7 | [infrastructure.md](infrastructure.md) | You are touching chord, telemetry, codemode, mcp, durable, env, or evals. |
 
-Existing docs you should prefer over these: `AGENTS.md` (repo rules for humans and agents),
-`CONTRIBUTING.md` (contribution gate), `packages/agent/docs/harness.md` (the normative harness
-spec), `packages/coding-agent/docs/` (user- and extension-facing documentation).
+Prefer these existing docs when they overlap: `AGENTS.md` (repo rules), `CONTRIBUTING.md`
+(contribution gate), `packages/coding-agent/docs/` (44 user- and extension-facing docs), the
+package `README.md` files, and `.pi/skills/` (`add-llm-provider.md`, `github-work.md`,
+`interactive-testing.md`, `release.md`).
 
 ## The one thing to know first
 
-`packages/agent` ships **three independent agent runtimes**. They share types and nothing else.
+There are **two agent runtimes**, and they share no implementation.
 
 | Runtime | Entry | State | Used by |
 |---------|-------|-------|---------|
-| Core agent | `packages/agent/src/agent.ts` | in-memory, process-local | `packages/coding-agent` via `core/sdk.ts` |
-| Harness | `packages/agent/src/harness/` | durable, crash-recoverable, JSONL/SQLite | not yet wired into the CLI |
-| Pico3 | `packages/agent/src/harness/pico3/` | experimental kernel, `./experimental/pico3` | `coding-agent/src/experimental/` |
+| Core agent | `packages/agent/src/agent.ts`, `agent-loop.ts` | in-memory, process-local | `packages/coding-agent` via `core/sdk.ts` |
+| Durable harness | `packages/durable/src/harness/` | durable, crash-recoverable, commits before publishing | not wired into the CLI; used by `packages/env` and standalone apps |
 
-`src/harness/` never imports `agent.ts` or `agent-loop.ts`. If you were told to "change the
-agent loop", confirm which of the three you mean. Only the core agent is on the hot path for
-the shipped `pi` binary.
+The `pi` binary uses the **core agent**. The durable harness is an experimental, separate
+runtime with its own conversations, tasks, documents, storage backends, and tool pipeline.
+`packages/agent` has no harness, session backend, or pico3 code anymore. If someone says
+"change the agent loop", confirm they mean `packages/agent/src/agent-loop.ts`.
 
 ## The second thing to know
 
-There are **two stacks** plus a shared vocabulary package.
+There is no experimental client/server stack in this checkout.
 
-- **Shipping** (what users run): `tui` + `ai` + `agent` + `coding-agent`, with JSONL session
-  storage in `agent/src/harness/session/`.
-- **Experimental** (gated on `PI_EXPERIMENTAL=1`, in `coding-agent/src/experimental/`): `chord`
-  + `durable` + `protocol` + `client` + `server`.
-- **`chord`** is shared by both, which is why `pi-agent-core` depends on it and re-exports its
-  context, even though every Chord *service* consumer sits in `src/experimental/`.
-
-Three packages have **no in-repo consumers** and should not be treated as load-bearing:
-`durable`, `session-backends/sqlite-node`, and `evals` (private). See
-[infrastructure.md](infrastructure.md).
+- **CLI stack:** `coding-agent` → `agent` + `ai` + `tui` + `codemode` + `mcp`.
+- **Durable stack:** `durable` → `chord` + `ai` + `codemode` + `telemetry`; `env` adds a
+  remote `ExecutionEnv` over SSH.
+- **`chord`** is a general-purpose runtime, not a Pi-specific layer. It depends only on
+  `telemetry` and `typebox`; Pi's CLI does not import it.
+- `protocol`, `client`, `server`, and `session-backends/sqlite-node` no longer exist.
+- `evals` is private and dev-only. `env` has no in-repo consumer besides its own tests.
 
 ## Quick start
 
 ```bash
 npm install --ignore-scripts   # do not run lifecycle scripts
-npm run build:offline         # needs packages/ai/src/providers/data/ (see development.md)
-npm run check                 # biome + 7 repo invariants + tsc --noEmit
+npm run hydrate:model-data    # required once: packages/ai/src/providers/data/ is gitignored
+npm run build:offline         # or npm run build, which hydrates first
+npm run check                 # biome + invariants + tsc + browser smoke
 ./test.sh                     # full suite, isolated HOME, no API keys
 ./pi-test.sh                  # run pi from TypeScript sources
 ```
+
+`npm run check` does not run tests. `./test.sh` is the supported test entry point.

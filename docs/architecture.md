@@ -1,138 +1,127 @@
 # Architecture
 
-## The repo is two stacks plus shared vocabulary
-
-Most confusion in this codebase comes from this: there is a **shipping stack** and an
-**experimental stack**, and they overlap in the `chord` package.
+## The monorepo in one picture
 
 ```
-                       ┌──────────────────────────────────────────┐
-   SHIPPING            │  coding-agent  (the `pi` CLI)             │
-   (what users run)    │    └─ src/modes/{interactive,print,json,rpc}│
-                       └────────────────────┬─────────────────────┘
-                                            │
-              ┌───────────────┬─────────────┼──────────────┐
-              ▼               ▼             ▼              ▼
-          agent-core          tui           ai          chord   (context only)
-       (agent.ts + harness/)             (41 providers)
-              │
-              ├──────────────────────────────► chord       (pico3 services)
-              └──────────────────────────────► telemetry
+                         coding-agent (the `pi` CLI)
+                         modes: interactive, print, json, rpc
+                          │        │        │        │
+              ┌───────────┘        │        │        └───────────┐
+              ▼                    ▼        ▼                    ▼
+          agent core             tui       ai             codemode / mcp
+        (agent + loop)             │     (providers)        (sandbox, client)
+              │                    │        │
+              └────────────────────┴────────┴──────────────► telemetry
 
-                       ┌──────────────────────────────────────────┐
-   EXPERIMENTAL         │  coding-agent/src/experimental/{micro,mini,services} │
-   (PI_EXPERIMENTAL=1)  └───────┬──────────────────────────┬────────┘
-                               ▼                          ▼
-                          client ◄── protocol ──► server
-                               │                          │
-                               └─────► durable (unwired) ◄┘
+   Standalone:  chord (objects/contracts) ──► durable (experimental harness) ──► env
+                                                   │
+                                                   └──► ai, codemode, telemetry
 ```
 
-Dependency direction is strict and enforced. `npm run build` hardcodes the topological order
-in `package.json:16`:
+There is no protocol/client/server stack and no second CLI runtime in this checkout.
+`packages/coding-agent/src/experimental/` contains only a source resolver used by `pi-test.sh`
+and codegen scripts.
+
+## Packages and dependency direction
+
+Build order is the dependency graph (`package.json:16`):
 
 ```
-chord → tui → telemetry → ai → durable → agent → sqlite-node → protocol → client → server → coding-agent
+telemetry → chord → tui → codemode → mcp → ai → durable → env → agent → coding-agent
 ```
 
-Workspace dependencies (nothing else crosses package boundaries):
+Workspace dependencies are exact pins, not ranges:
 
-| Package | Depends on |
-|---|---|
-| `chord` | *(nothing — only `esbuild`)* |
-| `telemetry` | *(nothing)* |
-| `tui` | *(nothing — only `get-east-asian-width`, `marked`)* |
-| `ai` | `telemetry` |
-| `durable` | `chord`, `ai` |
-| `agent` | `chord`, `ai`, `telemetry` |
-| `session-backends/sqlite-node` | `ai`, `agent` — **unwired** |
-| `protocol` | `chord` |
-| `client` | `chord`, `protocol` |
-| `server` | `chord`, `agent`, `protocol` |
-| `coding-agent` | `chord`, `agent`, `ai`, `tui` (+ dev: `client`, `protocol`, `server`) |
-| `evals` | *(private, dev-only)* |
+| Package | Name | Depends on |
+|---|---|---|
+| `telemetry` | `@earendil-works/pi-telemetry` | *(nothing)* |
+| `chord` | `@earendil-works/chord` | `telemetry`, `typebox` |
+| `tui` | `@earendil-works/pi-tui` | `get-east-asian-width`, `marked`, `marked-cjk-friendly` |
+| `codemode` | `@earendil-works/pi-codemode` | `quickjs-wasi` |
+| `mcp` | `@earendil-works/pi-mcp` | `cross-spawn` |
+| `ai` | `@earendil-works/pi-ai` | `telemetry`, provider SDKs, `typebox` |
+| `durable` | `@earendil-works/pi-durable` | `chord`, `ai`, `codemode`, `telemetry` (+ Photon, `diff`, `typebox`) |
+| `env` | `@earendil-works/pi-env` | `chord`, `durable` |
+| `agent` | `@earendil-works/pi-agent-core` | `ai`, `typebox` |
+| `coding-agent` | `@earendil-works/pi-coding-agent` | `agent`, `ai`, `tui`, `codemode`, `mcp` (+ app deps) |
+| `evals` | `@earendil-works/pi-evals` | *(private; no runtime deps)* |
 
-Chord is the odd one: `README.md:1-8` says it is deliberately **not a Pi package** and depends on
-no other Pi workspace package, so it can be used by unrelated applications. `PLANNING.md:26-37`
-goes further — it bans Pi vocabulary (`Session`, `Agent`, `model`, `tool`, `hook`, `server`,
-`client`) from becoming Chord concepts, and states the API is **not a stable contract yet**.
+`chord` deliberately depends on no Pi application package. It is a general object/contract
+runtime and is used here by `durable` and `env`, not by the `pi` CLI.
 
 ## Where a feature belongs
 
-`CONTRIBUTING.md:7-11` is the rule: *pi's core is minimal; if your feature does not belong in the
-core, it should be an extension.*
-
-Concretely:
+`CONTRIBUTING.md:7-11` is the rule: pi's core is minimal; features that do not belong in the
+core should be an extension.
 
 | You want to… | Put it in | Not in |
 |---|---|---|
-| Add a provider / model metadata | `packages/ai/src/providers/<id>.ts` + `scripts/generate-models.ts` | `coding-agent` |
-| Add a tool, command, event handler, CLI flag, keybinding | an extension: `packages/coding-agent/examples/extensions/` | `core/tools/`, `core/extensions/types.ts` |
-| Add a terminal widget or key handling | `packages/tui/src/components/` | `coding-agent` |
-| Change the agent loop | `packages/agent/src/agent-loop.ts` — but see the three-runtimes warning | |
-| Add a durable/rpc/storage concept | `packages/agent/src/harness/` (+ update `packages/agent/docs/harness.md`) | `agent.ts` |
+| Add a provider, API, model, image model, or classifier | `packages/ai/src/providers/`, `src/api/`, `scripts/generate-models.ts` | `coding-agent` |
+| Add a tool, command, event handler, CLI flag, or keybinding | an extension under `packages/coding-agent/examples/extensions/` | `core/tools/`, `core/extensions/types.ts` |
+| Add a terminal widget or key handling | `packages/tui/src/components/` or `src/keys.ts` | `coding-agent` |
+| Change the core agent loop | `packages/agent/src/agent-loop.ts` | `durable` |
+| Add a durable task, document, or storage backend | `packages/durable/src/` (+ `docs/spec.md`) | `packages/agent` |
+| Add sandbox/tool-calling script semantics | `packages/codemode/src/` | `coding-agent` |
+| Add MCP protocol or transport behavior | `packages/mcp/src/` | `coding-agent` |
+| Add user-facing documentation | `packages/coding-agent/docs/` | these internal docs |
 
-`packages/coding-agent` has exactly **one** built-in extension
-(`src/extensions/llama/`, hidden, registered at `src/extensions/index.ts:4`) and ~64 example
-extensions. That ratio is the intended shape of the project.
+The CLI ships **four** built-in extensions (`src/extensions/index.ts`):
+`llama.cpp` (not replaceable) and `codemode`, `tool-search`, `mcp` (replaceable by an extension
+that registers the same tool/command). It also carries 70 single-file example extensions and 9
+directory examples. That ratio is the intended shape: built-ins are infrastructure, examples
+show the extension API.
 
 ## Request lifecycle (shipping path)
 
-Follow one user prompt through the code:
+Follow one prompt through the CLI:
 
-1. `src/modes/interactive/interactive-mode.ts` (or `modes/print-mode.ts`, `modes/rpc/rpc-mode.ts`)
-   calls into `AgentSession`.
-2. `packages/coding-agent/src/core/sdk.ts:380-415` constructs a `pi-agent-core` `Agent`. The
-   `streamFn` it installs (`sdk.ts:389-400`) calls `ModelRuntime.streamSimple`.
-3. `Agent.prompt()` / `Agent.continue()` (`packages/agent/src/agent.ts:374-387`) guard against
-   concurrent runs, then `runWithLifecycle` (`agent.ts:507-530`) creates the `AbortController`
-   and calls `runAgentLoop`.
-4. `runAgentLoop` (`packages/agent/src/agent-loop.ts:101-125`) runs the turn loop
-   (`runLoop`, `agent-loop.ts:162-320`): emit pending messages → `prepareRequest` →
-   `streamAssistantResponse` → `executeToolCalls` → `finishTurn` → poll steering/follow-up queues.
-5. Tool execution: `executeToolCalls` (`agent-loop.ts:505-520`) picks sequential or parallel.
-   Sequential if `toolExecution === "sequential"` **or** any addressed tool declares
-   `executionMode: "sequential"` — one sequential tool serializes the whole batch.
-   `beforeToolCall` / `afterToolCall` hooks wrap each call (`agent-loop.ts:703-861`).
-6. The stream call goes through pi-ai: `Models.stream()` →
-   `Model.compat` flags → `api/<provider>.lazy.ts` → a concrete `src/api/<provider>.ts`
-   → provider SDK, emitting `AssistantMessageEvent`s.
-7. `processEvents` (`agent.ts:565-612`) reduces events into `AgentState` and awaits listeners
-   **in registration order**. `AgentSession` subscribes to those and persists entries, drives the
-   TUI, and fires extension events.
+1. `src/modes/interactive/interactive-mode.ts`, `modes/print-mode.ts`, or `modes/rpc/rpc-mode.ts`
+   calls into `AgentSession` (`core/agent-session.ts`).
+2. `core/sdk.ts:191` `createAgentSession()` builds a `pi-agent-core` `Agent` at
+   `sdk.ts:403-453`. Its `streamFn` (`:412-423`) calls `ModelRuntime.streamSimple`.
+3. `Agent.prompt()` / `Agent.continue()` (`packages/agent/src/agent.ts:382-405`) reject
+   concurrent runs, then `runWithLifecycle` (`agent.ts:517`) creates the `AbortController` and
+   calls `runAgentLoop` / `runAgentLoopContinue`.
+4. `runAgentLoop` (`packages/agent/src/agent-loop.ts:111-160`) announces tool changes, emits
+   `agent_start`/`turn_start`, then enters `runLoop` (`agent-loop.ts:171-330`).
+5. Each turn: `prepareNextTurn` (optional) → pending messages → `prepareRequest` (optional) →
+   `streamAssistantResponse` (`:390`) → stop/error check → `executeToolCalls` (`:518`) →
+   `finishTurn` (optional) → `turn_end`; then steering and follow-up queues are polled.
+6. Tool execution picks sequential (`:540`) or parallel (`:596`). It is sequential when
+   `toolExecution === "sequential"` or any addressed tool has `executionMode: "sequential"`.
+   `beforeToolCall` and `afterToolCall` wrap each call around `prepareToolCall`/finalization.
+7. The stream goes through pi-ai: `ModelRuntime` → `Models.stream()` →
+   `Model.compat` flags → `src/api/<api>.lazy.ts` → a concrete `src/api/<api>.ts` →
+   provider SDK or hand-rolled HTTP, emitting `AssistantMessageEvent`s.
+8. `Agent.processEvents` (`agent.ts:575`) reduces events into `AgentState` and awaits listeners
+   in registration order. `AgentSession` persists entries, drives the TUI, and emits extension
+   events from there.
 
-## Three runtimes in `packages/agent`
+## Agent runtimes
 
-Confirm which one you mean before changing anything.
-
-| Runtime | Entry | State model | Who uses it |
+| Runtime | Entry | State | Consumers |
 |---|---|---|---|
-| **Core agent** | `src/agent.ts`, `src/agent-loop.ts` | in-memory, process-local, `AgentState` | `coding-agent` via `core/sdk.ts` |
-| **Harness** | `src/harness/` | durable, crash-recoverable; entry tree + typed bound values + lanes; JSONL (`session/jsonl/`, format 4) or SQLite | not wired into the CLI |
-| **Pico3** | `src/harness/pico3/` (exported only as `./experimental/pico3`) | durable, compose-agent-behaviour-from-task-kinds | `coding-agent/src/experimental/micro/` |
+| **Core agent** | `packages/agent/src/agent.ts`, `agent-loop.ts` | in-memory `AgentState`; transcript lives in messages | `coding-agent`, SDK users |
+| **Durable harness** | `packages/durable/src/harness/` | committed conversations, entries, tasks, documents; crash recovery | `env`, standalone apps; **not the CLI** |
 
-The harness shares **only types** with the core agent. `src/harness/` contains zero imports of
-`agent.ts` or `agent-loop.ts`; it drives provider calls through its own
-`src/harness/execution/assistant.ts`.
+The core agent is provider-agnostic and only depends on `pi-ai` types and `StreamFn`. The
+coding agent installs `ModelRuntime.streamSimple` as its stream function and wires extensions
+around the loop.
 
-The normative spec is `packages/agent/docs/harness.md`. Its §0.9 is an implementation-status
-ledger with named debt items (J1, C1, R11, R12, T1, S3, H1) — read it before assuming a harness
-feature is complete. Note also `packages/agent/docs/mobile-handoff/README.md:22-28`:
-**"If a doc and the code disagree, the code wins."**
-
-`src/harness/search/index.ts` is four interfaces and zero implementation, and it is re-exported
-from the package root. Do not build on it (`docs/harness.md:149`).
+The durable harness is a separate implementation with its own task scheduler, storage
+backends, tool pipeline, compaction, and Chord-backed documents. See
+[infrastructure.md](infrastructure.md#durable--earendil-workspi-durable).
 
 ## Reading order for a first change
 
-- **In the CLI**: `src/main.ts` (bootstrap order, ~985 lines) → `core/sdk.ts` (agent wiring) →
-  `core/agent-session.ts` (the shared session class) → `modes/interactive/interactive-mode.ts`
-  (the TUI mode).
-- **In the loop**: `packages/agent/src/types.ts` (500 lines, all contracts) →
-  `src/agent-loop.ts` (`runLoop` then `executeToolCalls`) → `src/agent.ts` (`processEvents`).
-- **In providers**: `packages/ai/src/types.ts` (message + stream contracts) →
-  `src/models.ts` (`Models` / `createProvider`) → one `src/api/<x>.ts` and one
-  `src/providers/<x>.ts`.
+- **CLI:** `src/cli.ts` → `src/main.ts` → `core/sdk.ts` → `core/agent-session.ts` →
+  `modes/interactive/interactive-mode.ts`.
+- **Loop:** `packages/agent/src/types.ts` (539 lines, all contracts) →
+  `agent-loop.ts` (`runLoop`, then `executeToolCalls`) → `agent.ts` (`processEvents`).
+- **Providers:** `packages/ai/src/types.ts` → `models.ts` (`Models` / `createProvider`) →
+  one `src/api/<x>.ts` and one `src/providers/<x>.ts`.
+- **Extensions:** `packages/coding-agent/src/core/extensions/types.ts` →
+  `examples/extensions/` → `docs/extensions.md`.
 
 ## Related
 

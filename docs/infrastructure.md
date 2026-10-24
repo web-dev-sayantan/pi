@@ -1,195 +1,239 @@
 # Infrastructure Packages
 
-Everything that is not `ai`, `agent`, `tui`, or `coding-agent`. Most of it is experimental or
-unwired — read the status column before you invest.
+Everything that is not `ai`, `agent`, `tui`, or `coding-agent`.
 
 | Package | Status | One-liner |
 |---|---|---|
-| `telemetry` | **production, stable** | Vendor-neutral telemetry contracts, type-level only. |
-| `chord` | **real dependency, explicitly unstable** | Application-composition runtime: facets, services, replicated state, JSON deltas, context. |
-| `protocol` | experimental, load-bearing for client/server | Routed envelopes + hand-written CBOR + framing. `PROTOCOL_VERSION = 8`. |
-| `client` | experimental | Transport-neutral client for the protocol. No auto-recovery. |
-| `server` | experimental | Multi-presentation attachment host. Forwards opaque envelopes. |
-| `durable` | **unwired** | Durable conversation/task/document runtime ("Pico"). No in-repo consumers. |
-| `session-backends/sqlite-node` | **dead** | `node:sqlite` session backend, superseded. No consumers. |
-| `evals` | private, dev-only | Behavioral evals; builds two Docker images per case. |
+| `telemetry` | **stable** | Vendor-neutral spans, metrics, propagation, and stored-trace contracts. |
+| `chord` | **used, unstable** | Standalone object/contract runtime with replicated state, links, hot reload, and SQLite helpers. |
+| `codemode` | **stable, used by CLI** | Sandboxed JavaScript whose only capability is calling injected tools. |
+| `mcp` | **stable, used by CLI** | Standalone Model Context Protocol client with stdio/HTTP/OAuth. |
+| `durable` | **experimental** | Durable conversation/task/document harness. Consumed by `env`, not the CLI. |
+| `env` | **new, standalone** | Remote `ExecutionEnv`: a Rust daemon over SSH plus the client. No in-repo consumer. |
+| `evals` | private, dev-only | Behavioral evals for the coding agent. |
+
+There is no `protocol`, `client`, `server`, or `session-backends/sqlite-node` package in this
+checkout. The old remote stack and its SQLite backend were removed.
 
 ## `telemetry` — `@earendil-works/pi-telemetry`
 
-Contracts only: no exporter, no `AsyncLocalStorage`, no ambient current-span state, no backend
-dependency (`README.md:11-13`). Zero dependencies at all.
+Contracts, not an exporter: no backend dependency, no ambient current-span state, no global
+tracer. Runtime dependencies: none.
 
-The API is 22 lines: `TelemetryContext.startSpan(options, cb)` and `TelemetrySpan` — and a span
-**is** a context, so child spans nest naturally.
+The package now ships:
 
-Three design choices that will surprise you:
+- `TelemetryContext.startSpan(options, callback)` and `TelemetrySpan`; a span **is** a context, so
+  child spans nest naturally.
+- `SpanAttributes`, `SpanLink`, `SpanOptions`, `StoredSpan`/`StoredTrace`, and `TelemetryStore`
+  query contracts.
+- Optional `TelemetryPropagation` carriers and `TelemetryMetrics` counters/up-down
+  counters/histograms.
+- `NOOP_TELEMETRY_CONTEXT`, `NOOP_TELEMETRY_METRICS`, `NOOP_TELEMETRY_PROPAGATION`.
+- `InMemoryTelemetryContext` and `./render` (`renderTrace`).
+- `./testing`, an adapter conformance suite.
+
+Design choices that will surprise you:
 
 1. **There is no `span.end()`.** The callback settling *is* the end. Status is `ok` unless you set
    it or the callback throws.
-2. **`endAttributes` are always optional** ("completion enrichment"). Calling `setAttributes()`
-   zero times is valid — it exists for early failures and cancellation (`README.md:317`).
+2. **Completion attributes are optional.** Calling `setAttributes()` zero times is valid; it exists
+   for early failures and cancellation.
 3. `defineTelemetrySchema` is a **pure identity function with no runtime validation**. Duplicate
-   span names across composed schemas are a *compile* error (`UniqueTelemetrySchemas`), and
-   `ExactTelemetryAttributes` uses `Record<..., never>` to reject unknown keys. The safety is all
-   in the types.
+   span names across composed schemas are a compile error (`UniqueTelemetrySchemas`), and
+   `ExactTelemetryAttributes` uses `Record<..., never>` to reject unknown keys. The safety is in
+   the types.
 
-Consumers: `pi-ai` (request options), `pi-agent-core` (which owns
-`AI_TELEMETRY_SCHEMA` / `HARNESS_TELEMETRY_SCHEMA` / `AGENT_TELEMETRY_SCHEMAS` in
-`src/harness/telemetry.ts`, and the context key in `src/harness/context.ts:12`).
-`pi-coding-agent` does **not** import it.
+Consumers: `pi-ai` (`AI_TELEMETRY_SCHEMA` in `packages/ai/src/telemetry.ts`), `chord`
+(`Context.telemetry` and the `/telemetry-sqlite` adapter), and `durable`
+(`DURABLE_TELEMETRY_SCHEMA` in `packages/durable/src/harness/telemetry.ts`).
+`pi-coding-agent` declares no dependency on it.
 
-`packages/agent/docs/telemetry-schema.md` is **generated** from those schema constants by
-`packages/agent/scripts/generate-telemetry-docs.ts` (one function, `--check` mode fails when
-stale). Do not edit it by hand.
+`packages/chord/src/telemetry-sqlite/` implements `TelemetryStore` over SQLite with buffered
+spans, ten-second metric aggregates, retention, and bounded queues.
 
 ## `chord` — `@earendil-works/chord`
 
-The most confusing package, because it is a real dependency of six packages while insisting it
-is not a Pi package.
+A standalone runtime for applications made of **objects** that live in several processes and can
+be hot reloaded.
 
-`README.md:1-8`: *"It is developed as a standalone package in the Pi monorepo, but it is not a Pi
-package: it does not depend on any other Pi workspace package and can be used by unrelated
-applications."*
+- An **object** is state plus code at an address. It is created on demand and lives while someone
+  references it.
+- Everyone gets a **reference**, never the object. References work locally and across processes
+  and survive reloads.
+- A **facet** is a plugin's code for one host; a **registry** maps contracts to facets.
+- **State** is observable JSON. Remote viewers get a snapshot followed by deltas.
+- **Hot reload** swaps code while work in flight finishes on the old code; state is kept and
+  incompatible changes migrate at a safe point.
 
-`PLANNING.md:3`: *"**This is not a stable public API contract yet.**"* And `PLANNING.md:26-37`
-imposes hard constraints: no Pi deps, no imports from `@earendil-works/pi-*` or outside
-`packages/chord`, application-neutral vocabulary, Node-specific loading kept out of the
-platform-neutral runtime — plus a **banned-word list**: *Session, Harness, AgentLane, server,
-client, attachment, TUI, model, tool, hook, provider credential, workspace* must not become Chord
-concepts.
+Contracts are runtime values described with TypeBox schemas. Hosts exchange JSON frames over
+links: in memory, a Node IPC channel, or a WebSocket.
 
-Its headline feature (symmetric RPC) is still planned, not implemented.
+Status: published, but unstable in practice — recent minor releases in `CHANGELOG.md` carry
+`### Breaking Changes`. `PROTOCOL_VERSION = 4`; peers with different versions refuse to talk.
 
-### Modules
+Exports (9 subpaths): `.`, `./context`, `./output`, `./delta`, `./node`, `./telemetry-sqlite`,
+`./sqlite`, `./sqlite/node`, `./sqlite/cloudflare`. Runtime deps: `pi-telemetry` and `typebox`
+only.
+
+Module map:
 
 | Path | What |
 |---|---|
-| `src/api.ts` | `defineFacet`, `defineService`, `createFacetHost`, `replicatedState`, `createRemoteServiceBinding`. `defineService` throws on the reserved `$chord.` prefix. |
-| `src/services/` | 10 files. `provider.ts` (authoritative side), `consumer.ts`, `state.ts` (replication core), `state-codec.ts`, `wire.ts`, `instances.ts`, `handle.ts`, `loopback.ts`, `errors.ts`, `state-internals.ts`. |
-| `src/context/index.ts` | Go-style `Context`: `BACKGROUND_CONTEXT`, `createContextKey`, `withContextValue`, `withAbortSignal` (via `AbortSignal.any`), `withCancel`, `awaitWithContext`. `toString()` mirrors Go (`"[Context BACKGROUND_CONTEXT]"`). |
-| `src/delta/` | The JSON delta engine plus a **normative** `src/delta/README.md` with a mutation-rights table. |
-| `src/facets/` | `host.ts` (`FacetKernel`, lifecycle + generation state machines), `loader.ts`, `README.md`. |
-| `src/node/`, `src/bundler.ts` | esbuild-to-CJS facet bundling, `chord-facets.json` manifest (format 2, per-entry SHA-256), `node:vm` loading that bypasses Node's module cache. |
-| `src/json.ts` | `copyJson` — a strict validator rejecting non-finite numbers, cycles, non-plain prototypes, symbol keys, sparse arrays, and accessors. |
+| `src/contract.ts`, `declare.ts`, `object.ts` | `local`/`remote` contracts, cells/resources/listeners, factories. |
+| `src/host.ts`, `registry.ts`, `reload.ts` | `createHost`, `defineFacet`, `defineRegistry`, lifetimes, hot reload. |
+| `src/connection.ts`, `link.ts`, `wire.ts`, `websocket.ts`, `node.ts` | Links, framing, protocol version, IPC/WebSocket transports. |
+| `src/state.ts`, `cell.ts`, `watch.ts` | Replicated state, public subscriptions, watches. |
+| `src/delta/` | Transactional JSON tracker/diff/apply plus a **normative** `README.md` with mutation rights. |
+| `src/context/index.ts` | Explicit `Context`: cancellation + non-optional telemetry span. |
+| `src/output.ts` | Bounded output streams and paced progress. |
+| `src/sqlite/`, `src/telemetry-sqlite/` | Portable SQLite facade, migrations, and telemetry storage. |
 
-### Three Chord design details worth knowing
+Three design details worth knowing:
 
-- **`MemberSlot` is a `Proxy` over a callable** (`services/consumer.ts:24-64`). Applying it invokes
-  the remote method, `.value` returns local replicated state, `.subscribe` returns an unsubscribe
-  function, and `then` / `Symbol.toStringTag` are handled so the proxy never looks thenable. That
-  is how a remote service keeps a **stable facade** across disconnects and replacements.
-- **The delta engine refuses unknown verbs loudly.** `src/delta/index.ts:187-189` and `:273-275`:
-  *"Silently skipping an unknown verb is how a newer producer's op vanishes."* It also blocks
-  prototype-pollution paths (`RESERVED_SEGMENTS = {__proto__, constructor, prototype}`, checked on
-  every decode *and* every apply, because paths are data that can echo model output) and rejects
-  out-of-range indices that would allocate huge sparse arrays. Writes use `Object.defineProperty`
-  so an inherited setter cannot run.
-- **Facet reload keeps service handles connected.** `src/facets/README.md:213-221`: candidates are
-  activated and validated *while current providers stay routed*, so stable service handles never
-  go disconnected during an ordinary reload.
+- **The delta engine refuses unknown verbs loudly** (`src/delta/index.ts:187-189`, `:273-275`):
+  *"Silently skipping an unknown verb is how a newer producer's op vanishes."* It rejects
+  `__proto__`/`constructor`/`prototype` path segments on every decode and apply, and rejects
+  out-of-range indices that would allocate huge sparse arrays.
+- **State is not frozen.** The tracker uses trusted immutable ownership rather than defensive
+  copying; mutating a published value can corrupt authority. Clone or serialize at any mutable
+  trust boundary (`src/delta/README.md`).
+- **`Context` carries telemetry explicitly.** `BACKGROUND_CONTEXT` uses the no-op span; adapters
+  start root spans and never travel inside a context.
 
-### How `pi-agent-core` uses it — two very different ways
+Consumers: `durable` (documents, watches, delta, context) and `env` (context). The `pi` CLI does
+not import it.
 
-1. **Context is fully replaced.** `packages/agent/src/harness/context.ts:14-25` re-exports eight
-   primitives straight from `@earendil-works/chord/context` and adds one pi-specific key
-   (`TELEMETRY_CONTEXT_KEY`). All of `pi-agent-core`'s cancellation and context propagation *is*
-   Chord's implementation.
-2. **Pico3 speaks Chord service semantics.**
-   `packages/agent/src/harness/pico3/chord.ts:42-43` defines `pi.harness` (local-only) and
-   `pi.conversation` (remote-exposable) services. `attachChordView` (`:81-150`) bridges Pico's
-   commit-granular watch envelopes to one Chord publication per commit: the raw listener only
-   **enqueues**, and a microtask drain applies ops and publishes with *"no await between them"*.
-   The queue is bounded (`WATCH_CAPACITY`); overflow deliberately **fails the bridge** and tells
-   the owner to respawn its keyed service instance rather than silently dropping updates.
+Docs: `README.md`, `docs/tutorial.md`, `docs/guide.md`, `docs/spec.md` (normative), and
+`src/delta/README.md`.
 
-Chord's delta engine is also used directly by `pico3/{view,memory,session,jsonl,types}.ts` and
-`pico3/legacy-tracker.ts`.
+## `codemode` — `@earendil-works/pi-codemode`
 
-## `protocol`, `client`, `server` — the experimental remote stack
+Runs model-written JavaScript in a QuickJS VM compiled to WebAssembly. The only capability is
+calling injected tools; nested tool calls never enter the LLM context — only the script's output
+and return value do.
 
-These three exist together. `PROTOCOL_VERSION = 8`, and `README.md` says outright: *"The
-protocol is experimental and has no compatibility guarantees."* Peer authentication is **not**
-implemented.
+- Node/Bun: `CodemodeSandbox` runs each execution in a worker thread.
+- Cloudflare Workers/DO: `RemoteCodemodeSandbox` on `/portable`, with the deployable object in
+  `/cloudflare`.
+- `InlineCodemodeSandbox` runs on the calling thread for other runtimes.
 
-**`protocol`** — `src/index.ts` is 22 lines over four modules: hand-written CBOR (`src/cbor/`, no
-`cbor` dependency), `codec.ts`, `framing.ts`. The route is
-`{serverId, sessionId, attachmentId}` — a combined durable address fencing a call to one server,
-one durable session, and one live presentation attachment. The frame is a 4-byte big-endian length
-plus one definite-length CBOR item, and decoders accept arbitrary fragmentation and coalescing.
-Strictness: all envelope schemas reject unknown properties, codecs recursively reject non-JSON
-payloads, and limits are 16 MiB payload / 1,000,000 entries / 64 nesting levels.
-`attach()` / `detach()` return **no** routing ids — the server publishes the live route out of band.
+Scripts use `tools`, `ALL_TOOLS`, `text()`, `image()`, `exit()`, `store()`/`load()`, `console`,
+and `return`; they may start with a `// @options:` line. There are no Node APIs, network, timers,
+modules, or `WebAssembly`.
 
-**`client`** — `Client`, `createClientServiceTransport`, `ByteTransport`, `ConnectionState`.
-It verifies the physical endpoint reports the expected logical `serverId` at handshake. It
-**deliberately does not construct typed service proxies** (`README.md:30`) — typed APIs come from
-application-owned Chord bindings. And there is **no auto-recovery** (`README.md:34`): on
-disconnect, pending requests reject locally but accepted work may still complete remotely. Callers
-must `reconnect()`, re-attach, and repeat only safe operations. The `./unix` subpath
-(`createUnixTransportFactory`, `discoverUnixServers`) derives each expected server id from the
-socket filename and verifies via handshake, skipping malformed/stale entries.
+Key invariants:
 
-**`server`** — `RoutedServerServiceHost.attachClient()` gives a connection-scoped server endpoint;
-`RoutedSessionHandle.attachClient()` gives a presentation-scoped Session capability whose
-`invokeService()` **forwards the opaque envelope without server-side business decoding**. Repeat
-`attach` from one connection is idempotent. Each attachment gets a server-generated id delivered
-only as routing control data. **The real `Session` and `AgentHarness` never cross the process
-boundary.**
+- `execute()` resolves with an outcome; script failures are data (`error.kind` is
+  `script | timeout | aborted | sandbox`), not rejected promises.
+- Output and store limits are explicit: 16 Mi chars / 100,000 output items, 256 Ki per stored
+  value / 1 Mi total.
+- `sandbox.start()` gives deterministic replay: virtual clock, seeded randomness, UTC, and
+  ordered results.
+- `portable` and `cloudflare` entries are budgeted so they cannot reach Node built-ins, the
+  worker-thread host, or the file-based wasm loader.
 
-All three are consumed only from `packages/coding-agent/src/experimental/`
-(`server.ts`, `client-runtime.ts`, `client-tui.ts`, `session-worker.ts`,
-`session-worker-manager.ts`, `radius-relay.ts`) plus two tests each. They are devDependencies of
-`coding-agent`, not runtime dependencies.
+Consumers: `coding-agent` (the built-in `codemode` tool and its worker) and `durable` (its
+`./codemode` extension). `README.md` is the reference.
 
-## `durable` — unwired
+## `mcp` — `@earendil-works/pi-mcp`
 
-`@earendil-works/pi-durable`: *"Durable conversation, task, and document runtime for Pi… This
-package contains the Pico runtime."*
+A small, standalone Model Context Protocol client. It does not depend on the official MCP SDK or
+on other Pi packages. Runtime dependency: `cross-spawn`.
 
-**No package in the monorepo imports it.** Grep finds only its own tests, its own vitest alias,
-the root `tsconfig.json` path map, and `scripts/durable-browser-smoke-entry.ts`. It is a parallel
-storage stack that `pi-agent-core`'s own `harness/session/*` reimplements.
+- Transport-neutral `McpClient`; `StdioTransport`, `StreamableHttpTransport`, and an in-memory
+  testing transport.
+- `McpClient` owns initialization, request correlation, timeouts, cancellation, server requests,
+  and protocol helpers: tools, resources, resource templates, progress, logging, and
+  tool-list-change notifications.
+- `/oauth` provides the MCP OAuth client subset, discovery, callback server, and credential
+  provider; it does not open a browser or choose credential storage.
+- Protocol target: MCP `2025-11-25`, negotiating down to `2024-11-05`. Batch JSON-RPC, legacy
+  HTTP+SSE, servers, sampling, and tasks are out of scope.
 
-Worth knowing if you touch it:
+Consumer: `coding-agent` (`src/extensions/mcp/`), including `pi mcp` and the
+`test:mcp-conformance` harness.
 
-- The root entry is runtime-neutral. SQLite adapters for Bun / Cloudflare Durable Objects
-  implement a **synchronous** `SqliteDatabase` facade (`README.md:30-32`); remote async APIs like
-  Cloudflare D1 *"cannot implement this synchronous facade; they require a dedicated `Storage`
-  backend."*
-- Durability guarantees are deliberately weakened: JSONL `fsync` defaults to `false`; SQLite uses
-  WAL + `synchronous = NORMAL` and checkpoints on close, so *"acknowledged commits survive
-  process crashes, but the newest commits may be lost after a power or host failure."*
-- Single-owner only: cross-process locking and ID allocation are not supported.
+## `env` — `@earendil-works/pi-env`
 
-Design docs: `packages/durable/docs/pico-v5.md`, `pico-v5-handoff.md`, `pico-v5-chord-usage.md`.
+Remote execution environments for Durable:
 
-## `session-backends/sqlite-node` — dead
+- `daemon/` is a small Rust program that runs on the remote machine and speaks a framed protocol
+  on stdin/stdout.
+- `RemoteExecutionEnv` implements Durable's `ExecutionEnv` through a `Connection`.
+- `ssh.ts` handles host-key scanning/acceptance, daemon deployment (named by SHA-256 and verified
+  before every start), and SSH connection setup.
+- `LocalExecutionEnv` is `NodeExecutionEnv` plus `listFiles()`, matching the remote daemon's
+  behavior. `RemoteTerminal` and `RemoteWatcher` cover terminals and file watching.
 
-`@earendil-works/pi-session-backend-sqlite-node`. `src/index.ts` wraps `node:sqlite`'s
-`DatabaseSync` and exports a self-contained `src/sqlite/` implementation. No consumers outside its
-own directory (only `tsconfig.json` and `package-lock.json` reference it). It was renamed from
-`@earendil-works/pi-storage-sqlite-node` (`CHANGELOG.md:37`) — a leftover of a superseded storage
-design.
+Wire protocol v1: `u32 length | u8 type | u32 id | u32 jsonLength | json | bytes`, 16 MiB cap, a
+sync line that discards shell startup noise, and framing errors that end the connection. SSH runs
+with batch mode, strict host-key checking, no forwarding, no shared connections, and no configured
+commands.
 
-It is **not** the same thing as `pi-durable`'s `storage/sqlite/node`.
+No package in the repo consumes `env`; it is published for Durable applications. Docs:
+`README.md`, `docs/protocol.md`, `docs/semantics.md`.
 
-## `evals` — private, dev-only
+## `durable` — `@earendil-works/pi-durable`
 
-`"private": true`, and the only workspace with no `dependencies` at all. Behavioral evals for the
-coding agent: `*.docs.eval.ts` (documentation lift) and `*.host.eval.ts`. Runner in `src/`
-(`cli.ts`, `docker.ts`, `plan.ts`, `report.ts`, `harness.ts`). No `src/index.ts` — it is an
-application, not a library.
+**Experimental.** A durable agent harness: conversations, model turns, tool calls, and your own
+state are committed to storage before anything is shown. If the process dies mid-turn, reopening
+the storage resumes from the last commit.
 
-Methodology (`README.md:71-107`): build **two** Docker images (`without_docs` / `with_docs`),
-pack the workspace, plan every `(case, variant, model, runNumber)` arm up front, run each arm in a
-fresh container, and only count a pair when **both** arms produce exactly one score — otherwise the
-pair is blocked and headline lift is withheld. Repetition order alternates by run number to reduce
-order bias. Requires `PI_PROVIDER` and `PI_MODEL`.
+Built on `pi-ai` for model access, `chord` for document state, `pi-codemode` for code mode, and
+`pi-telemetry` for spans/metrics. `env` depends on it; the `pi` CLI does not.
 
-Cost note: artifacts may contain prompts, responses, generated code, and tool output. The README
-also notes that Docker alone cannot prove agent-written code never touches the network.
+Core model:
+
+- **Harness**: one open storage plus the scheduling machinery. Every change goes through one
+  atomic commit line; nothing is published before its commit is stored.
+- **Conversation**: a transcript of immutable entries. `root()` creates the root conversation;
+  conversations can fork.
+- **Entry**: one immutable transcript record (`pi.user`, `pi.assistant`, `pi.tool-result`,
+  `pi.system`, `pi.reset`, or an app kind).
+- **Task**: a durable state machine that checkpoints every step. Built-in tasks are
+  `pi.generation` and `pi.tool`; tasks can own child tasks.
+- **Submission**: input or an entry handed to a conversation, with `wait()` for its answer.
+- **Document**: typed JSON changed in the same commit as entries. Built-ins cover agent choices,
+  provider identity, live state, inbox, usage, and nested calls.
+
+Features: resumable/crash-safe tasks, steering and follow-ups, compaction, retries, tool hooks,
+nested tool calls, tool search/deferred tools, codemode with journaled replay, image processing,
+per-conversation usage/cost, task graphs, forking, read-only sessions, and shared storage/env
+conformance suites.
+
+Storage: memory, JSONL, IndexedDB, and SQLite (Node and Cloudflare). SQLite uses WAL +
+`synchronous = NORMAL`; JSONL `fsync` is off by default. Acknowledged commits survive process
+crashes, but the newest may be lost after a power or host failure. One process owns a storage at a
+time; there is no cross-process locking.
+
+Errors: a storage error is fatal to the open Session; an invalid read fails only that read; user
+code fails only its own unit (`SessionFailed`, `ReadOnlySession`, `ConversationBusy`,
+`ReadAfterWrite`, `StorageRequestError` in `src/errors.ts`).
+
+Docs: `README.md` (usage) and `docs/spec.md` (normative). `./testing` exports
+`createStorageConformance`, `createEnvConformance`, and runner helpers.
+
+## `evals` — `@earendil-works/pi-evals`
+
+`"private": true`; no runtime `dependencies`, seven devDependencies including `pi-ai`,
+`pi-coding-agent`, and `vitest-evals`. It is an application, not a library: no `src/index.ts`.
+
+- `evals/*.docs.eval.ts` are documentation-lift evals. `eval:docs` runs each case in
+  `without_docs` and `with_docs` containers and reports lift.
+- Other `evals/*.eval.ts` files are host evals, run by Vitest on this machine.
+- Runner in `src/` (`cli.ts`, `docker.ts`, `plan.ts`, `report.ts`, `harness.ts`).
+- Two Docker images are built once per comparison run; cases are discovered in both and must
+  match. Every `(case, variant, model, runNumber)` arm is planned before execution and run in a
+  fresh container.
+- A pair counts toward lift only when **both** arms produce exactly one score; missing, duplicate,
+  skipped, pending, unscored, or errored arms block the pair and withhold headline lift.
+  Repetition order alternates by run number.
+- Requires `PI_PROVIDER` and `PI_MODEL`, or `--provider`/`--model`.
+
+Artifacts may contain prompts, responses, generated code, and tool output. Docker alone cannot
+prove agent-written code never touches the network.
 
 ## Related
 
-- [architecture.md](architecture.md) — the two-stack diagram and dependency order
+- [architecture.md](architecture.md) — package map and dependency order
 - [development.md](development.md) — build order, which is this dependency graph
